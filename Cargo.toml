@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+
+members = ["crates/*", "xtask"]
+
+default-members = ["crates/templatize-bin"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Jimmie Fulton <jimmie.fulton@gmail.com>"]
+documentation = "https://archetect.github.io"
+edition = "2021"
+homepage = "https://archetect.github.io"
+license = "MIT"
+repository = "https://github.com/archetect/templatize"
+publish = true
+
+[workspace.dependencies] 
+templatize-core = { path = "crates/templatize-core", version = "0.1.0" }
+
+anyhow = "1"
+clap = { version = "4", features = ["cargo", "derive", "env", "string"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+inflections = "1.1"
+inquire = "0.7"
+regex = "1.10"
+similar = "2.6"
+convert_case = "0.6"

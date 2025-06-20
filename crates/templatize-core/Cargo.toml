@@ -1,0 +1,15 @@
+[package]
+name = "templatize-core"
+description = "Templatize: Core"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+convert_case.workspace = true

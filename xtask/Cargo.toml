@@ -1,0 +1,12 @@
+[package]
+name = "templatize-xtask"
+description = "Templatize: Xtask"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
