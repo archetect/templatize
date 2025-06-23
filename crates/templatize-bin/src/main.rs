@@ -26,19 +26,23 @@ fn main() -> Result<()> {
         } => {
             // Validate that at least one of -p or -c is specified
             if !path && !contents {
-                use inquire::Confirm;
+                use inquire::MultiSelect;
                 
-                let enable_path = Confirm::new("Enable path templating (-p)?")
-                    .with_default(true)
-                    .prompt()?;
-                    
-                let enable_contents = Confirm::new("Enable contents templating (-c)?")
-                    .with_default(true)
+                let options = vec![
+                    "Path templating (-p)",
+                    "Contents templating (-c)",
+                ];
+                
+                let selected = MultiSelect::new("Select templating options:", options)
+                    .with_default(&[0, 1]) // Both options selected by default
                     .prompt()?;
                 
-                if !enable_path && !enable_contents {
-                    anyhow::bail!("At least one of --path (-p) or --contents (-c) must be enabled");
+                if selected.is_empty() {
+                    anyhow::bail!("At least one templating option must be selected");
                 }
+                
+                let enable_path = selected.contains(&"Path templating (-p)");
+                let enable_contents = selected.contains(&"Contents templating (-c)");
                 
                 return handle_exact_command(
                     token, 
@@ -64,19 +68,23 @@ fn main() -> Result<()> {
         } => {
             // Validate that at least one of -p or -c is specified
             if !path && !contents {
-                use inquire::Confirm;
+                use inquire::MultiSelect;
                 
-                let enable_path = Confirm::new("Enable path templating (-p)?")
-                    .with_default(true)
-                    .prompt()?;
-                    
-                let enable_contents = Confirm::new("Enable contents templating (-c)?")
-                    .with_default(true)
+                let options = vec![
+                    "Path templating (-p)",
+                    "Contents templating (-c)",
+                ];
+                
+                let selected = MultiSelect::new("Select templating options:", options)
+                    .with_default(&[0, 1]) // Both options selected by default
                     .prompt()?;
                 
-                if !enable_path && !enable_contents {
-                    anyhow::bail!("At least one of --path (-p) or --contents (-c) must be enabled");
+                if selected.is_empty() {
+                    anyhow::bail!("At least one templating option must be selected");
                 }
+                
+                let enable_path = selected.contains(&"Path templating (-p)");
+                let enable_contents = selected.contains(&"Contents templating (-c)");
                 
                 return handle_shapes_command(
                     token, 

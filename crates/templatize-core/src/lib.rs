@@ -46,7 +46,19 @@ pub fn process_directory(
         content_changes: 0,
     };
     
-    process_directory_recursive(target, &templater, &options, &mut result)?;
+    if target.is_file() {
+        process_file(target, &templater, &options, &mut result)?;
+    } else if target.is_dir() {
+        // First, process all contents inside the target directory
+        process_directory_contents_recursive(target, &templater, &options, &mut result)?;
+        
+        // Finally, rename the target directory itself if needed
+        if options.process_paths {
+            rename_target_directory(target, &templater, &options, &mut result)?;
+        }
+    } else {
+        anyhow::bail!("Target does not exist or is not a file or directory: {:?}", target);
+    }
     
     info!(
         "Processing complete: {} files processed, {} paths renamed, {} content changes",
@@ -111,16 +123,19 @@ where
         content_changes: 0,
     };
     
-    process_directory_recursive_interactive(
-        target, 
-        &templater, 
-        process_paths, 
-        process_contents, 
-        dry_run, 
-        &content_callback, 
-        &path_callback, 
-        &mut result
-    )?;
+    if target.is_file() {
+        process_file_interactive(target, &templater, process_paths, process_contents, dry_run, &content_callback, &path_callback, &mut result)?;
+    } else if target.is_dir() {
+        // First, process all contents inside the target directory
+        process_directory_contents_recursive_interactive(target, &templater, process_paths, process_contents, dry_run, &content_callback, &path_callback, &mut result)?;
+        
+        // Finally, rename the target directory itself if needed
+        if process_paths {
+            rename_target_directory_interactive(target, &templater, process_paths, process_contents, dry_run, &content_callback, &path_callback, &mut result)?;
+        }
+    } else {
+        anyhow::bail!("Target does not exist or is not a file or directory: {:?}", target);
+    }
     
     info!(
         "Interactive processing complete: {} files processed, {} paths renamed, {} content changes",
@@ -165,6 +180,63 @@ where
     Ok(result)
 }
 
+fn process_directory_contents_recursive(
+    dir: &Path,
+    templater: &ExactTemplater,
+    options: &TemplateOptions,
+    result: &mut TemplatizeResult,
+) -> Result<()> {
+    debug!("Processing directory contents: {:?}", dir);
+    
+    let entries: Vec<_> = fs::read_dir(dir)?
+        .collect::<Result<Vec<_>, _>>()?;
+    
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    
+    // First, recursively process subdirectories' CONTENTS (depth-first)
+    for dir_path in &directories {
+        process_directory_contents_recursive(dir_path, templater, options, result)?;
+    }
+    
+    // Then process files in current directory (while paths are still valid)
+    for file_path in &files {
+        process_file(file_path, templater, options, result)?;
+    }
+    
+    // Finally, rename subdirectories in reverse order (deepest paths first)
+    // This happens after all files in this directory are processed
+    if options.process_paths {
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if options.dry_run {
+                    info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                } else {
+                    info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                    fs::rename(dir_path, &new_path)?;
+                }
+                result.paths_renamed += 1;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 fn process_directory_recursive(
     dir: &Path,
     templater: &ExactTemplater,
@@ -176,55 +248,71 @@ fn process_directory_recursive(
     let entries: Vec<_> = fs::read_dir(dir)?
         .collect::<Result<Vec<_>, _>>()?;
     
-    // Process files first
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_file() {
-            process_file(&path, templater, options, result)?;
-        }
-    }
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
     
-    // Then process directories recursively
-    for entry in &entries {
+    for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            process_directory_recursive(&path, templater, options, result)?;
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
         }
     }
     
-    // Finally, process directory renaming (do this last to avoid path issues)
+    // First, recursively process all subdirectories' CONTENTS (but don't rename the subdirectories yet)
+    for dir_path in &directories {
+        process_directory_contents_recursive(dir_path, templater, options, result)?;
+    }
+    
+    // Then process files in current directory
+    for file_path in &files {
+        process_file(file_path, templater, options, result)?;
+    }
+    
+    // Finally, rename subdirectories in reverse order (deepest paths first)
+    // This ensures we rename child directories only after all their contents are processed
     if options.process_paths {
-        for entry in &entries {
-            let path = entry.path();
-            if path.is_dir() {
-                // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-                if let Some(new_full_path) = templater.process_full_path(&path) {
-                    if options.dry_run {
-                        info!("Would rename directory: {:?} -> {:?}", path, new_full_path);
-                    } else {
-                        info!("Renaming directory: {:?} -> {:?}", path, new_full_path);
-                        // Ensure parent directory exists
-                        if let Some(parent) = new_full_path.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::rename(&path, &new_full_path)?;
-                    }
-                    result.paths_renamed += 1;
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if options.dry_run {
+                    info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                } else {
+                    info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                    fs::rename(dir_path, &new_path)?;
                 }
-                // Fall back to single component replacement if full path replacement didn't match
-                else if let Some(new_name) = templater.process_path_component(&path) {
-                    let new_path = path.parent().unwrap().join(&new_name);
-                    
-                    if options.dry_run {
-                        info!("Would rename directory: {:?} -> {:?}", path, new_path);
-                    } else {
-                        info!("Renaming directory: {:?} -> {:?}", path, new_path);
-                        fs::rename(&path, &new_path)?;
-                    }
-                    result.paths_renamed += 1;
-                }
+                result.paths_renamed += 1;
             }
         }
+    }
+    
+    Ok(())
+}
+
+fn rename_target_directory(
+    target: &Path,
+    templater: &ExactTemplater,
+    options: &TemplateOptions,
+    result: &mut TemplatizeResult,
+) -> Result<()> {
+    debug!("Checking if target directory needs renaming: {:?}", target);
+    
+    // Only use component replacement to rename target directory within its current parent
+    if let Some(new_name) = templater.process_path_component(target) {
+        let new_path = target.parent().unwrap().join(&new_name);
+        
+        if options.dry_run {
+            info!("Would rename target directory: {:?} -> {:?}", target, new_path);
+        } else {
+            info!("Renaming target directory: {:?} -> {:?}", target, new_path);
+            fs::rename(target, &new_path)?;
+        }
+        result.paths_renamed += 1;
     }
     
     Ok(())
@@ -259,24 +347,9 @@ fn process_file(
         }
     }
     
-    // Process file path
+    // Process file path (only rename within current directory)
     if options.process_paths {
-        // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-        if let Some(new_full_path) = templater.process_full_path(file_path) {
-            if options.dry_run {
-                info!("Would rename file: {:?} -> {:?}", file_path, new_full_path);
-            } else {
-                info!("Renaming file: {:?} -> {:?}", file_path, new_full_path);
-                // Ensure parent directory exists
-                if let Some(parent) = new_full_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(file_path, &new_full_path)?;
-            }
-            path_changed = true;
-        }
-        // Fall back to single component replacement if full path replacement didn't match
-        else if let Some(new_name) = templater.process_path_component(file_path) {
+        if let Some(new_name) = templater.process_path_component(file_path) {
             let new_path = file_path.parent().unwrap().join(&new_name);
             
             if options.dry_run {
@@ -355,6 +428,107 @@ fn escape_file(
     Ok(())
 }
 
+fn process_directory_contents_recursive_interactive<F, G>(
+    dir: &Path,
+    templater: &ExactTemplater,
+    process_paths: bool,
+    process_contents: bool,
+    dry_run: bool,
+    content_callback: &F,
+    path_callback: &G,
+    result: &mut TemplatizeResult,
+) -> Result<()>
+where
+    F: Fn(&Path, &str, &str, &str) -> Result<bool>,
+    G: Fn(&Path, &Path, &str) -> Result<bool>,
+{
+    debug!("Processing interactive directory contents: {:?}", dir);
+    
+    let entries: Vec<_> = fs::read_dir(dir)?
+        .collect::<Result<Vec<_>, _>>()?;
+    
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    
+    // First, recursively process subdirectories' CONTENTS (depth-first)
+    for dir_path in &directories {
+        process_directory_contents_recursive_interactive(dir_path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+    }
+    
+    // Then rename subdirectories in reverse order (deepest paths first)
+    // This establishes the new directory structure before processing files
+    if process_paths {
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if path_callback(dir_path, &new_path, "Directory")? {
+                    if dry_run {
+                        info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                    } else {
+                        info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                        fs::rename(dir_path, &new_path)?;
+                    }
+                    result.paths_renamed += 1;
+                }
+            }
+        }
+    }
+    
+    // Finally, process files in current directory after directories are renamed
+    for file_path in &files {
+        process_file_interactive(file_path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+    }
+    
+    Ok(())
+}
+
+fn rename_target_directory_interactive<F, G>(
+    target: &Path,
+    templater: &ExactTemplater,
+    _process_paths: bool,
+    _process_contents: bool,
+    dry_run: bool,
+    _content_callback: &F,
+    path_callback: &G,
+    result: &mut TemplatizeResult,
+) -> Result<()>
+where
+    F: Fn(&Path, &str, &str, &str) -> Result<bool>,
+    G: Fn(&Path, &Path, &str) -> Result<bool>,
+{
+    debug!("Checking if target directory needs interactive renaming: {:?}", target);
+    
+    // Only use component replacement to rename target directory within its current parent
+    if let Some(new_name) = templater.process_path_component(target) {
+        let new_path = target.parent().unwrap().join(&new_name);
+        
+        if path_callback(target, &new_path, "Target Directory")? {
+            if dry_run {
+                info!("Would rename target directory: {:?} -> {:?}", target, new_path);
+            } else {
+                info!("Renaming target directory: {:?} -> {:?}", target, new_path);
+                fs::rename(target, &new_path)?;
+            }
+            result.paths_renamed += 1;
+        }
+    }
+    
+    Ok(())
+}
+
 fn process_directory_recursive_interactive<F, G>(
     dir: &Path,
     templater: &ExactTemplater,
@@ -369,61 +543,51 @@ where
     F: Fn(&Path, &str, &str, &str) -> Result<bool>,
     G: Fn(&Path, &Path, &str) -> Result<bool>,
 {
-    debug!("Processing directory: {:?}", dir);
+    debug!("Processing interactive directory: {:?}", dir);
     
     let entries: Vec<_> = fs::read_dir(dir)?
         .collect::<Result<Vec<_>, _>>()?;
     
-    // Process files first
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_file() {
-            process_file_interactive(&path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
-        }
-    }
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
     
-    // Then process directories recursively
-    for entry in &entries {
+    for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            process_directory_recursive_interactive(&path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
         }
     }
     
-    // Finally, process directory renaming (do this last to avoid path issues)
+    // First, recursively process all subdirectories' CONTENTS (but don't rename the subdirectories yet)
+    for dir_path in &directories {
+        process_directory_contents_recursive_interactive(dir_path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+    }
+    
+    // Then process files in current directory
+    for file_path in &files {
+        process_file_interactive(file_path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+    }
+    
+    // Finally, rename subdirectories in reverse order (deepest paths first)
+    // This ensures we rename child directories only after all their contents are processed
     if process_paths {
-        for entry in &entries {
-            let path = entry.path();
-            if path.is_dir() {
-                // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-                if let Some(new_full_path) = templater.process_full_path(&path) {
-                    if path_callback(&path, &new_full_path, "Directory")? {
-                        if dry_run {
-                            info!("Would rename directory: {:?} -> {:?}", path, new_full_path);
-                        } else {
-                            info!("Renaming directory: {:?} -> {:?}", path, new_full_path);
-                            // Ensure parent directory exists
-                            if let Some(parent) = new_full_path.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            fs::rename(&path, &new_full_path)?;
-                        }
-                        result.paths_renamed += 1;
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if path_callback(dir_path, &new_path, "Directory")? {
+                    if dry_run {
+                        info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                    } else {
+                        info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                        fs::rename(dir_path, &new_path)?;
                     }
-                }
-                // Fall back to single component replacement if full path replacement didn't match
-                else if let Some(new_name) = templater.process_path_component(&path) {
-                    let new_path = path.parent().unwrap().join(&new_name);
-                    
-                    if path_callback(&path, &new_path, "Directory")? {
-                        if dry_run {
-                            info!("Would rename directory: {:?} -> {:?}", path, new_path);
-                        } else {
-                            info!("Renaming directory: {:?} -> {:?}", path, new_path);
-                            fs::rename(&path, &new_path)?;
-                        }
-                        result.paths_renamed += 1;
-                    }
+                    result.paths_renamed += 1;
                 }
             }
         }
@@ -471,26 +635,9 @@ where
         }
     }
     
-    // Process file path
+    // Process file path (only rename within current directory)
     if process_paths {
-        // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-        if let Some(new_full_path) = templater.process_full_path(file_path) {
-            if path_callback(file_path, &new_full_path, "File")? {
-                if dry_run {
-                    info!("Would rename file: {:?} -> {:?}", file_path, new_full_path);
-                } else {
-                    info!("Renaming file: {:?} -> {:?}", file_path, new_full_path);
-                    // Ensure parent directory exists
-                    if let Some(parent) = new_full_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::rename(file_path, &new_full_path)?;
-                }
-                path_changed = true;
-            }
-        }
-        // Fall back to single component replacement if full path replacement didn't match
-        else if let Some(new_name) = templater.process_path_component(file_path) {
+        if let Some(new_name) = templater.process_path_component(file_path) {
             let new_path = file_path.parent().unwrap().join(&new_name);
             
             if path_callback(file_path, &new_path, "File")? {
@@ -602,7 +749,13 @@ pub fn process_directory_shapes(
     if target.is_file() {
         process_file_shapes(target, &templater, process_paths, process_contents, dry_run, &mut result)?;
     } else if target.is_dir() {
-        process_directory_recursive_shapes(target, &templater, process_paths, process_contents, dry_run, &mut result)?;
+        // First, process all contents inside the target directory
+        process_directory_contents_recursive_shapes(target, &templater, process_paths, process_contents, dry_run, &mut result)?;
+        
+        // Finally, rename the target directory itself if needed
+        if process_paths {
+            rename_target_directory_shapes(target, &templater, process_paths, process_contents, dry_run, &mut result)?;
+        }
     } else {
         anyhow::bail!("Target does not exist or is not a file or directory: {:?}", target);
     }
@@ -655,6 +808,91 @@ where
     Ok(result)
 }
 
+fn process_directory_contents_recursive_shapes(
+    dir: &Path,
+    templater: &CaseShapeTemplater,
+    process_paths: bool,
+    process_contents: bool,
+    dry_run: bool,
+    result: &mut TemplatizeResult,
+) -> Result<()> {
+    debug!("Processing shapes directory contents: {:?}", dir);
+    
+    let entries: Vec<_> = fs::read_dir(dir)?
+        .collect::<Result<Vec<_>, _>>()?;
+    
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    
+    // First, recursively process subdirectories' CONTENTS (depth-first)
+    for dir_path in &directories {
+        process_directory_contents_recursive_shapes(dir_path, templater, process_paths, process_contents, dry_run, result)?;
+    }
+    
+    // Then rename subdirectories in reverse order (deepest paths first)
+    // This establishes the new directory structure before processing files
+    if process_paths {
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if dry_run {
+                    info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                } else {
+                    info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                    fs::rename(dir_path, &new_path)?;
+                }
+                result.paths_renamed += 1;
+            }
+        }
+    }
+    
+    // Finally, process files in current directory after directories are renamed
+    for file_path in &files {
+        process_file_shapes(file_path, templater, process_paths, process_contents, dry_run, result)?;
+    }
+    
+    Ok(())
+}
+
+fn rename_target_directory_shapes(
+    target: &Path,
+    templater: &CaseShapeTemplater,
+    _process_paths: bool,
+    _process_contents: bool,
+    dry_run: bool,
+    result: &mut TemplatizeResult,
+) -> Result<()> {
+    debug!("Checking if target directory needs shapes renaming: {:?}", target);
+    
+    // Only use component replacement to rename target directory within its current parent
+    if let Some(new_name) = templater.process_path_component(target) {
+        let new_path = target.parent().unwrap().join(&new_name);
+        
+        if dry_run {
+            info!("Would rename target directory: {:?} -> {:?}", target, new_path);
+        } else {
+            info!("Renaming target directory: {:?} -> {:?}", target, new_path);
+            fs::rename(target, &new_path)?;
+        }
+        result.paths_renamed += 1;
+    }
+    
+    Ok(())
+}
+
 fn process_directory_recursive_shapes(
     dir: &Path,
     templater: &CaseShapeTemplater,
@@ -668,53 +906,45 @@ fn process_directory_recursive_shapes(
     let entries: Vec<_> = fs::read_dir(dir)?
         .collect::<Result<Vec<_>, _>>()?;
     
-    // Process files first
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_file() {
-            process_file_shapes(&path, templater, process_paths, process_contents, dry_run, result)?;
-        }
-    }
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
     
-    // Then process directories recursively
-    for entry in &entries {
+    for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            process_directory_recursive_shapes(&path, templater, process_paths, process_contents, dry_run, result)?;
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
         }
     }
     
-    // Finally, process directory renaming (do this last to avoid path issues)
+    // First, recursively process all subdirectories' CONTENTS (but don't rename the subdirectories yet)
+    for dir_path in &directories {
+        process_directory_contents_recursive_shapes(dir_path, templater, process_paths, process_contents, dry_run, result)?;
+    }
+    
+    // Then process files in current directory
+    for file_path in &files {
+        process_file_shapes(file_path, templater, process_paths, process_contents, dry_run, result)?;
+    }
+    
+    // Finally, rename subdirectories in reverse order (deepest paths first)
+    // This ensures we rename child directories only after all their contents are processed
     if process_paths {
-        for entry in &entries {
-            let path = entry.path();
-            if path.is_dir() {
-                // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-                if let Some(new_full_path) = templater.process_full_path(&path) {
-                    if dry_run {
-                        info!("Would rename directory: {:?} -> {:?}", path, new_full_path);
-                    } else {
-                        info!("Renaming directory: {:?} -> {:?}", path, new_full_path);
-                        // Ensure parent directory exists
-                        if let Some(parent) = new_full_path.parent() {
-                            fs::create_dir_all(parent)?;
-                        }
-                        fs::rename(&path, &new_full_path)?;
-                    }
-                    result.paths_renamed += 1;
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if dry_run {
+                    info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                } else {
+                    info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                    fs::rename(dir_path, &new_path)?;
                 }
-                // Fall back to single component replacement if full path replacement didn't match
-                else if let Some(new_name) = templater.process_path_component(&path) {
-                    let new_path = path.parent().unwrap().join(&new_name);
-                    
-                    if dry_run {
-                        info!("Would rename directory: {:?} -> {:?}", path, new_path);
-                    } else {
-                        info!("Renaming directory: {:?} -> {:?}", path, new_path);
-                        fs::rename(&path, &new_path)?;
-                    }
-                    result.paths_renamed += 1;
-                }
+                result.paths_renamed += 1;
             }
         }
     }
@@ -753,24 +983,9 @@ fn process_file_shapes(
         }
     }
     
-    // Process file path
+    // Process file path (only rename within current directory)
     if process_paths {
-        // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-        if let Some(new_full_path) = templater.process_full_path(file_path) {
-            if dry_run {
-                info!("Would rename file: {:?} -> {:?}", file_path, new_full_path);
-            } else {
-                info!("Renaming file: {:?} -> {:?}", file_path, new_full_path);
-                // Ensure parent directory exists
-                if let Some(parent) = new_full_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(file_path, &new_full_path)?;
-            }
-            path_changed = true;
-        }
-        // Fall back to single component replacement if full path replacement didn't match
-        else if let Some(new_name) = templater.process_path_component(file_path) {
+        if let Some(new_name) = templater.process_path_component(file_path) {
             let new_path = file_path.parent().unwrap().join(&new_name);
             
             if dry_run {
@@ -812,56 +1027,46 @@ where
     let entries: Vec<_> = fs::read_dir(dir)?
         .collect::<Result<Vec<_>, _>>()?;
     
-    // Process files first
-    for entry in &entries {
-        let path = entry.path();
-        if path.is_file() {
-            process_file_shapes_interactive(&path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
-        }
-    }
+    // Collect directories and files separately for depth-first processing
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
     
-    // Then process directories recursively
-    for entry in &entries {
+    for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            process_directory_recursive_shapes_interactive(&path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+            directories.push(path);
+        } else if path.is_file() {
+            files.push(path);
         }
     }
     
-    // Finally, process directory renaming (do this last to avoid path issues)
+    // First, recursively process subdirectories (depth-first)
+    for dir_path in &directories {
+        process_directory_recursive_shapes_interactive(dir_path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+    }
+    
+    // Then process files in current directory
+    for file_path in &files {
+        process_file_shapes_interactive(file_path, templater, process_paths, process_contents, dry_run, content_callback, path_callback, result)?;
+    }
+    
+    // Finally, process directory renaming in reverse order (deepest first)
+    // This ensures we rename child directories before parent directories
     if process_paths {
-        for entry in &entries {
-            let path = entry.path();
-            if path.is_dir() {
-                // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-                if let Some(new_full_path) = templater.process_full_path(&path) {
-                    if path_callback(&path, &new_full_path, "Directory")? {
-                        if dry_run {
-                            info!("Would rename directory: {:?} -> {:?}", path, new_full_path);
-                        } else {
-                            info!("Renaming directory: {:?} -> {:?}", path, new_full_path);
-                            // Ensure parent directory exists
-                            if let Some(parent) = new_full_path.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            fs::rename(&path, &new_full_path)?;
-                        }
-                        result.paths_renamed += 1;
+        directories.reverse(); // Process in reverse order for safety
+        for dir_path in &directories {
+            // Only use component replacement to rename directory within its current parent
+            if let Some(new_name) = templater.process_path_component(dir_path) {
+                let new_path = dir_path.parent().unwrap().join(&new_name);
+                
+                if path_callback(dir_path, &new_path, "Directory")? {
+                    if dry_run {
+                        info!("Would rename directory: {:?} -> {:?}", dir_path, new_path);
+                    } else {
+                        info!("Renaming directory: {:?} -> {:?}", dir_path, new_path);
+                        fs::rename(dir_path, &new_path)?;
                     }
-                }
-                // Fall back to single component replacement if full path replacement didn't match
-                else if let Some(new_name) = templater.process_path_component(&path) {
-                    let new_path = path.parent().unwrap().join(&new_name);
-                    
-                    if path_callback(&path, &new_path, "Directory")? {
-                        if dry_run {
-                            info!("Would rename directory: {:?} -> {:?}", path, new_path);
-                        } else {
-                            info!("Renaming directory: {:?} -> {:?}", path, new_path);
-                            fs::rename(&path, &new_path)?;
-                        }
-                        result.paths_renamed += 1;
-                    }
+                    result.paths_renamed += 1;
                 }
             }
         }
@@ -909,26 +1114,9 @@ where
         }
     }
     
-    // Process file path
+    // Process file path (only rename within current directory)
     if process_paths {
-        // First try full path replacement (for multi-level path tokens like "com/acme/widgets")
-        if let Some(new_full_path) = templater.process_full_path(file_path) {
-            if path_callback(file_path, &new_full_path, "File")? {
-                if dry_run {
-                    info!("Would rename file: {:?} -> {:?}", file_path, new_full_path);
-                } else {
-                    info!("Renaming file: {:?} -> {:?}", file_path, new_full_path);
-                    // Ensure parent directory exists
-                    if let Some(parent) = new_full_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::rename(file_path, &new_full_path)?;
-                }
-                path_changed = true;
-            }
-        }
-        // Fall back to single component replacement if full path replacement didn't match
-        else if let Some(new_name) = templater.process_path_component(file_path) {
+        if let Some(new_name) = templater.process_path_component(file_path) {
             let new_path = file_path.parent().unwrap().join(&new_name);
             
             if path_callback(file_path, &new_path, "File")? {
