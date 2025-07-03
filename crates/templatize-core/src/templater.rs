@@ -89,7 +89,7 @@ impl JinjaEscaper {
         if self.jinja_pattern.is_match(content) {
             let escaped = self.jinja_pattern.replace_all(content, |caps: &regex::Captures| {
                 let inner = caps.get(1).unwrap().as_str().trim();
-                format!("{{{{'{{'}}}}{{ {} }}", inner)
+                format!("{{{{'{{'}}}}{{ {} }}}}", inner)
             });
             let count = self.jinja_pattern.find_iter(content).count();
             debug!("Jinja escaping: found {} Jinja expressions", count);
@@ -300,7 +300,7 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(
             result.unwrap(),
-            "This {{'{'}}{ project-name } has {{'{'}}{ some-value } and {{'{'}}{ another-var }."
+            "This {{'{'}}{ project-name }} has {{'{'}}{ some-value }} and {{'{'}}{ another-var }}."
         );
     }
 
@@ -324,7 +324,32 @@ mod tests {
         assert!(result.is_some());
         assert_eq!(
             result.unwrap(),
-            "{{'{'}}{ project-name } and {{'{'}}{ spaced-var } should both be escaped."
+            "{{'{'}}{ project-name }} and {{'{'}}{ spaced-var }} should both be escaped."
+        );
+    }
+
+    #[test]
+    fn test_jinja_escaping_closing_braces_fix() {
+        let escaper = JinjaEscaper::new().unwrap();
+        
+        // Test the specific case mentioned in the bug report
+        let content = "{{ example }}";
+        let result = escaper.escape_content(content);
+        
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap(),
+            "{{'{'}}{ example }}"
+        );
+        
+        // Test multiple variables to ensure closing braces are preserved
+        let content2 = "{{ var1 }} and {{ var2 }}";
+        let result2 = escaper.escape_content(content2);
+        
+        assert!(result2.is_some());
+        assert_eq!(
+            result2.unwrap(),
+            "{{'{'}}{ var1 }} and {{'{'}}{ var2 }}"
         );
     }
 
